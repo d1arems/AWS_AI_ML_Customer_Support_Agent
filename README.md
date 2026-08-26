@@ -1,173 +1,323 @@
-# Customer Support Chatbot with Amazon Bedrock AgentCore
+# Guided Lab 09 — Kubernetes Services (LoadBalancer)
 
-In this project you will build a customer support chatbot using the **Amazon Bedrock AgentCore managed harness**. The chatbot will handle customers' messages for a fictional online shop and must handle each of the following types of messages:
+> Scope: **type: LoadBalancer** on a real cloud cluster (AKS). Default namespace. We’ll provision a small AKS cluster, deploy the same NGINX app (with readiness & liveness), expose it with a **public IP**, and verify end-to-end from the internet. No Ingress yet—that comes later.
 
-* **bug reports** — collect the details over the conversation, then file a ticket
-* **platform questions** — answer from the shop's FAQ
-* **anything else** — politely hand the customer off to the human support line
+---
 
-The centerpiece of the project is **prompt engineering**: all of the routing, information gathering, and grounding behavior lives in a single system prompt that you design. The harness supplies the agent loop (model calls, session memory, tool execution) — your prompt supplies the behavior.
+## 1) Introduction — You Have Internal & Node-Level Access… But What About the Internet?
 
-> **Why AgentCore?** Bedrock *Agents Classic* was closed to new customers on July 30, 2026, so this course uses its successor, the AgentCore managed harness. Bedrock Evaluations — which you'll use for testing — is unaffected.
+You’ve already covered:
 
-There are a number of resources available to you to develop this application:
+* **ClusterIP** — stable, in-cluster communication by name.
+* **NodePort** — quick external door via `<nodeIP>:<nodePort>` on every node.
 
-* `create_bug_report` — a tool (Lambda function) that creates a ticket in a database, exposed to your chatbot through an **AgentCore Gateway**
-* `online_shop_faq.md` — a fictional FAQ your application should use to respond to customer questions
-* ready-made setup scripts and CloudFormation templates, so you spend your time on the prompt, not the plumbing
+Those are great—but product teams usually ask a different question:
 
-You will create the harness, iterate on its system prompt, and then test it in various scenarios.
+> “Can our users on the **public internet** reach this service at a **stable IP/DNS** without knowing node IPs or odd ports?”
 
-## Getting Started
+That’s where a **LoadBalancer Service** shines.
 
-### Dependencies
+### What a LoadBalancer Service Is (Practically)
 
-- An AWS account with Amazon Bedrock and Amazon Bedrock AgentCore access enabled.
-- AWS CLI configured with appropriate credentials.
-- Python 3.9+ with `boto3` 1.43+ installed (`pip install -r requirements.txt`).
-- Access to the Amazon Nova Pro model. **This project pins `us.amazon.nova-pro-v1:0` everywhere** — do not rely on the harness default model, which requires an AWS Marketplace subscription that lab accounts cannot complete.
-- Work in **us-east-1**; the scripts and templates assume it.
+* You declare `type: LoadBalancer` on your Service.
+* Kubernetes talks to the **cloud provider** (here: Azure) to **provision a cloud load balancer + public IP**.
+* Traffic to that public IP is sent to your cluster and **load-balanced across Ready Pods** (through NodePorts/ClusterIP behind the scenes).
 
-### Project Files
+### Why It Matters
 
-| File | Description |
-|------|-------------|
-| `docs/tools-setup.md` | Step-by-step guide for creating the bug report tool and gateway. |
-| `docs/testing.md` | Step-by-step guide for automated testing and running Bedrock Evaluations. |
-| `solution/` | Reference solution with the complete system prompt and test suite. |
-| `cloudformation-tool.yaml` | Creates the DynamoDB table, the `create_bug_report` Lambda, and the IAM roles for the gateway and the harness. |
-| `cloudformation-testing.yaml` | Creates the resources used to test your final application (S3 bucket + evaluation role). |
-| `create_bug_report.py` | The Lambda function code (also embedded in the tool template) that stores bug reports in DynamoDB. |
-| `setup_gateway.py` | Creates the AgentCore Gateway and registers the Lambda as the `create_bug_report` tool. |
-| `system_prompt.txt` | **Your main deliverable** — the system prompt for the chatbot. |
-| `create_harness.py` | Creates (or updates) the managed harness from `system_prompt.txt`. Re-run it every time you change your prompt. |
-| `chat.py` | A terminal chat client for trying out your chatbot in a multi-turn session. |
-| `generate-eval-dataset.py` | Runs your harness against a test suite and produces a JSONL file for Bedrock Evaluations. |
-| `harness-tests-template.json` | Template for developing your test suite. |
-| `cleanup_agentcore.py` | Deletes the harness, gateway target, and gateway when you're done. |
+* **Stable, internet-facing endpoint** without managing external LBs yourself.
+* **First production-like exposure**: real public IP, real cloud primitives.
+* Same Deployment and labels. Only the Service type changes.
 
-## Project Instructions
+We’ll stand up AKS, deploy the app, create a LoadBalancer Service, wait for an **EXTERNAL-IP**, and curl it from your machine.
 
-### Step 1: Create Resources for your application
+---
 
-First you will deploy the tool your application needs to create bug reports, plus the IAM roles AgentCore requires.
+## 2) Prepare a Small AKS Cluster (One-Time for this Lab)
 
-When a customer reports a bug, the chatbot needs to persist it somewhere so the engineering team can follow up. In this project we use a DynamoDB table as a simple ticket store, and a Lambda function as the tool implementation. The chatbot reaches the Lambda through an **AgentCore Gateway** — the gateway presents the Lambda to the model as a callable tool named `create_bug_report`.
-
-**1. Deploy the tool stack** (DynamoDB table + Lambda + IAM roles):
+> Requires Azure CLI logged into an Azure subscription with permissions to create resources.
 
 ```bash
-aws cloudformation deploy \
-  --template-file cloudformation-tool.yaml \
-  --stack-name bug-report-tool-stack \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region us-east-1
+# 2.1 Create a resource group
+az group create -n rg-aks-lb-lab -l westeurope
+
+# 2.2 Create a minimal AKS cluster (1 node is fine for the lab)
+az aks create -g rg-aks-lb-lab -n aks-lb-lab --node-count 1 --generate-ssh-keys --node-vm-size Standard_B2s
+
+# 2.3 Fetch kubeconfig
+az aks get-credentials -g rg-aks-lb-lab -n aks-lb-lab
+
+# 2.4 Verify connectivity
+kubectl get nodes
 ```
 
-The `--capabilities CAPABILITY_NAMED_IAM` flag is required because the template creates named IAM roles. Besides the Lambda and the table, the stack creates two AgentCore roles whose ARNs appear in the stack outputs: a **gateway role** (lets the gateway invoke the Lambda) and a **harness execution role** (lets the harness call Bedrock models and invoke the gateway).
+**What this does (at a glance):**
 
-**2. Create the gateway and register the tool:**
+* Creates a managed Kubernetes control plane and a node pool.
+* Configures your `kubectl` to talk to AKS.
+
+**Let’s recap:** You now have a real cloud cluster where `type: LoadBalancer` can provision an Azure public IP automatically.
+
+---
+
+## 3) Reuse Your Deployment (Probes Included)
+
+Keep files tidy:
 
 ```bash
-python setup_gateway.py
+cd ~
+mkdir -p ~/k8s-labs/services/loadbalancer
+cd ~/k8s-labs/services/loadbalancer
 ```
 
-The script reads the stack outputs itself and saves everything the later steps need to `agentcore_config.json`. For a deeper walkthrough (including how to test the Lambda in isolation), follow [Tools Setup](docs/tools-setup.md).
-
-> If `setup_gateway.py` fails right after the stack finishes with an access or validation error mentioning the role, that's IAM propagation delay — the script already retries, but if it still fails just run it again a minute later.
-
-### Step 2: Build the harness — design the system prompt
-
-Now the fun part. Open `system_prompt.txt` and write the system prompt for your chatbot. Your application needs to handle three different types of requests, and **the routing between them is done entirely by your prompt** — there are no condition nodes or classifiers, just instructions:
-
-- **Bug reports** — if a customer reports a bug on the website, the application needs to collect additional information and then create a ticket using the `create_bug_report` tool.
-- **Platform questions** — the application should answer common questions about orders, shipping, returns, and payments using the FAQ.
-- **Other requests** — if the message is neither a bug report nor answerable from the FAQ, the application should politely redirect the customer to a human support phone line.
-
-The `create_bug_report` tool accepts three parameters:
-
-* Bug description
-* Steps to reproduce
-* Environment where the user experienced the bug
-
-Customers rarely provide all three up front. Because the harness keeps **session state** across turns, your chatbot can simply *ask* for what's missing — make sure your prompt tells it to collect all three fields (and how to behave while collecting them, e.g. one question at a time) before calling the tool, and to give the customer their ticket ID afterwards.
-
-Platform questions (orders, shipping, returns, payments) need to be answered from the shop's FAQ. Here we will use the simplest approach and embed the document directly in the prompt — the model sees it at inference time and answers from it. Keep the `{{FAQ}}` placeholder in `system_prompt.txt`; `create_harness.py` replaces it with the contents of `online_shop_faq.md` automatically.
-
-> **Note:** Embedding documents in the prompt works well for short, stable content like a FAQ. For large documents, embedding the full text in every prompt becomes expensive and hits context limits. The standard solution is **Retrieval-Augmented Generation (RAG)**, which retrieves only the relevant passages at query time using a vector index. RAG with Amazon Bedrock Knowledge Bases is outside the scope of this course.
-
-When your prompt is ready, create the harness and chat with it:
+Create the Deployment:
 
 ```bash
-python create_harness.py     # first run takes ~2-3 minutes
-python chat.py               # each run = one fresh conversation
+touch 00-nginx-deploy.yaml
+vi 00-nginx-deploy.yaml
 ```
 
-Iterating is fast: edit `system_prompt.txt`, re-run `create_harness.py` (it updates the existing harness), and start a new `chat.py` session.
+Paste:
 
-#### Some suggestions
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.21.1
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+            limits:
+              cpu: "200m"
+```
 
-Here are some things to keep in mind while working on your application:
-
-* Treat routing as a classification problem inside your prompt: describe the three categories crisply and tell the model to pick exactly one before doing anything else. Vague category definitions produce vague routing.
-* Be explicit about the bug-report checklist (description, steps to reproduce, environment) and tell the model **not** to call the tool until every item is collected. Asking one question at a time works noticeably better than asking for everything at once.
-* Tell the model to answer platform questions *only* from the FAQ, and what to do when the FAQ doesn't cover the question (that's the hand-off case).
-* When the tool succeeds it returns a `ticketId` — instruct the model to relay it to the customer, so you can find the ticket in DynamoDB later.
-* Verify tickets really land in the database: `aws dynamodb scan --table-name <BugReportsTableName from stack outputs> --region us-east-1`.
-* The tool call appears in `chat.py` as a `[tool call] bugreports___create_bug_report` line — if you never see it, your prompt probably isn't telling the model clearly when to use the tool. The Lambda also logs every event it receives to CloudWatch Logs (`/aws/lambda/bug-report-tool-stack-create-bug-report`), which is the ground truth for what actually reached it.
-* There is no "prepare" step and nothing to redeploy: the harness picks up prompt changes as soon as `create_harness.py` finishes.
-* Try to implement and test your solution step by step.
-* Use the us-east-1 region, as some smaller regions might not have all Bedrock AgentCore features.
-
-### Step 3: Testing
-
-Once your chatbot works, you can keep testing it manually with `chat.py`. However, this approach is tedious and not scalable. Ideally we want an automated way to test the application.
-
-To test your application you will do the following:
-
-* Create a set of test prompts and define expected results — copy `harness-tests-template.json` (e.g. to `harness-tests.json`) and fill in your test cases. Cover all three routes: at least one FAQ question, one bug report, and one out-of-scope request.
-* Run your application programmatically on this set of prompts:
-
-  ```bash
-  python generate-eval-dataset.py --tests-json harness-tests.json
-  ```
-
-  Each test case runs in a fresh session and the final responses are written to `output_eval_dataset.jsonl` in the Bedrock Evaluations input format.
-* Deploy the testing stack (S3 bucket + evaluation role), upload the JSONL, and use **Bedrock Evaluations** (LLM-as-a-judge) to score your application's outputs:
-
-  ```bash
-  aws cloudformation deploy \
-    --template-file cloudformation-testing.yaml \
-    --stack-name bug-report-testing-stack \
-    --capabilities CAPABILITY_NAMED_IAM \
-    --region us-east-1
-  ```
-
-Follow the steps in the [Testing and Evaluation](docs/testing.md) document to upload the dataset and create the evaluation job.
-
-## Cleanup
-
-When you are done with the project, delete the AgentCore resources and the CloudFormation stacks to avoid ongoing charges. **Empty the evaluation S3 bucket first** — CloudFormation cannot delete a bucket that still contains objects, so if you skip that step the testing stack ends up in `DELETE_FAILED`:
+Apply and confirm:
 
 ```bash
-python cleanup_agentcore.py
-aws cloudformation delete-stack --stack-name bug-report-tool-stack --region us-east-1
-aws s3 rm s3://udacity-agentic-engineer-c1-eval-<YOUR_ACCOUNT_ID> --recursive
-aws cloudformation delete-stack --stack-name bug-report-testing-stack --region us-east-1
+kubectl apply -f 00-nginx-deploy.yaml
+kubectl rollout status deploy/nginx-deployment
+kubectl get pods -l app=nginx -o wide
 ```
 
-(The bucket name is in the testing stack's outputs. If the testing stack already shows `DELETE_FAILED`, empty the bucket and run its `delete-stack` command again.)
+**Why this matters:** The Deployment sets **labels** (`app: nginx`) and exposes container `port: 80`. Readiness will control which Pods are eligible for traffic.
 
-This removes the harness, gateway, Lambda function, DynamoDB table, IAM roles, and S3 bucket created during the project.
+**Recap:** Two healthy Pods, ready to sit behind a cloud load balancer.
 
-## Built With
+---
 
-* [Amazon Bedrock AgentCore managed harness](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html) - Runs the chatbot: agent loop, sessions, and tool execution
-* [Amazon Bedrock AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html) - Exposes the bug report Lambda as a tool
-* [Amazon Bedrock Evaluations](https://docs.aws.amazon.com/bedrock/latest/userguide/evaluation.html) - LLM-as-a-judge evaluation
-* [AWS Lambda](https://aws.amazon.com/lambda/) - Bug report tool runtime
-* [Amazon DynamoDB](https://aws.amazon.com/dynamodb/) - Bug report storage
+## 4) Create a LoadBalancer Service
 
-## License
+```bash
+touch 01-nginx-svc-loadbalancer.yaml
+vi 01-nginx-svc-loadbalancer.yaml
+```
 
-[License](../LICENSE.md)
+Paste:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-svc-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80         # Service port (public-facing)
+      targetPort: 80   # Pod's containerPort
+```
+
+Apply and watch for a public IP:
+
+```bash
+kubectl apply -f 01-nginx-svc-loadbalancer.yaml
+
+# Watch until EXTERNAL-IP is allocated (may take 30-120s)
+kubectl get svc nginx-svc-lb -w
+```
+
+When `EXTERNAL-IP` shows a value (e.g., `20.101.x.y`), open a new terminal and test:
+
+```bash
+EXTERNAL_IP=$(kubectl get svc nginx-svc-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl -I http://$EXTERNAL_IP
+curl    http://$EXTERNAL_IP | head -n 10
+```
+
+**What just happened behind the scenes:**
+
+* AKS created an **Azure Public IP** and an **Azure Load Balancer**.
+* The LB forwards to NodePorts in your cluster (wired by Kubernetes), then to **Ready** endpoints selected by your Service’s labels.
+
+**Let’s recap:** With one YAML change (`type: LoadBalancer`), you exposed the app to the internet—no custom infra work.
+
+---
+
+## 5) Quick Drills to Build Intuition
+
+### 5.1 Readiness affects real users
+
+Break readiness briefly and observe accessibility.
+
+```bash
+# Create a patch that makes readiness fail
+cat > 02-readiness-broken.yaml <<'EOF'
+spec:
+  template:
+    spec:
+      containers:
+        - name: nginx
+          readinessProbe:
+            httpGet:
+              path: /does-not-exist
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+EOF
+
+kubectl patch deploy nginx-deployment --type merge --patch-file 02-readiness-broken.yaml
+kubectl rollout status deploy/nginx-deployment
+
+# Endpoints should shrink / exclude NotReady Pods
+kubectl describe endpoints nginx-svc-lb | sed -n '1,200p'
+
+# From your machine — retry a few times
+curl -I http://$EXTERNAL_IP
+```
+
+Now fix it:
+
+```bash
+kubectl apply -f 00-nginx-deploy.yaml
+kubectl rollout status deploy/nginx-deployment
+kubectl describe endpoints nginx-svc-lb | sed -n '1,200p'
+curl -I http://$EXTERNAL_IP
+```
+
+**What you learned:** The public LoadBalancer **respects readiness** all the way down; NotReady Pods drop out of rotation.
+
+---
+
+### 5.2 Scale and observe load balancing
+
+Scale up and watch endpoints grow:
+
+```bash
+kubectl scale deploy/nginx-deployment --replicas=4
+kubectl rollout status deploy/nginx-deployment
+kubectl get endpoints nginx-svc-lb -o wide
+```
+
+Call the external IP multiple times (you may see different `Server` headers/connection details across requests depending on client behavior and LB config, but the key is more endpoints are eligible).
+
+**Recap:** The cloud LB fronts your Service, which fronts multiple Ready Pods—scaling feels natural to the caller.
+
+---
+
+## 6) Troubleshooting
+
+* **`EXTERNAL-IP` stays `<pending>`**
+
+  * Ensure you’re on a cloud cluster (AKS) with the Azure cloud provider enabled (the default for AKS).
+  * Check Service events:
+
+    ```bash
+    kubectl describe svc nginx-svc-lb | sed -n '1,200p'
+    ```
+  * Verify the AKS cluster is in a ready state:
+
+    ```bash
+    az aks show -g rg-aks-lb-lab -n aks-lb-lab --query "provisioningState"
+    ```
+
+* **Public IP works intermittently**
+
+  * Check Pod readiness and restarts:
+
+    ```bash
+    kubectl get pods -l app=nginx
+    kubectl describe pod $(kubectl get pod -l app=nginx -o jsonpath='{.items[0].metadata.name}') | sed -n '1,240p'
+    ```
+  * Ensure `targetPort` matches the containerPort (80).
+
+* **Need HTTPS / custom ports**
+
+  * For this lab, we stick to port 80. TLS/host routing belongs to **Ingress** (up next).
+
+* **You’re not using AKS**
+
+  * On **minikube**, you can simulate with:
+
+    ```bash
+    # Start a tunnel to allocate an external IP locally
+    minikube tunnel
+    kubectl apply -f 01-nginx-svc-loadbalancer.yaml
+    kubectl get svc nginx-svc-lb -w
+    ```
+  * On bare metal, consider **MetalLB** (out of scope for this lab).
+
+---
+
+## 7) Clean Up (optional)
+
+```bash
+# Kubernetes objects
+kubectl delete svc nginx-svc-lb
+kubectl delete deploy nginx-deployment
+
+# Azure resources
+az group delete -n rg-aks-lb-lab --yes --no-wait
+```
+
+*(If you plan to do the Ingress lab next on the same cluster, keep the AKS resources and only delete the Service/Deployment.)*
+
+---
+
+## Wrap-Up — What Did You Learn?
+
+* **type: LoadBalancer** gives you a **public IP** fronting your Service—no manual LB setup.
+* Azure (AKS) automatically provisions the **cloud load balancer** and wires it to your cluster.
+* The whole path remains **label/selector → EndpointSlices (Ready only) → kube-proxy → NodePorts → Pods**.
+* You verified end-to-end from the public internet, saw **readiness** affect traffic, and experienced **scaling** behind a stable public endpoint.
